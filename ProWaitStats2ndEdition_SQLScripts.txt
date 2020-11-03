@@ -1,0 +1,328 @@
+The queries below represent those from the book that have enduring value because they query specific information that can be used for troubleshooting in your own systems after having read the book and having gained an understanding from the book of what wait statistics are and how they can be used.
+
+-- Listing 1.1
+-- Query scheduling information
+SELECT
+  r.session_id AS 'Session ID',
+  r.command AS 'Type of Request',
+  qt.[text] AS 'Query Text',
+  t.task_address AS 'Task Address',
+  t.task_state AS 'Task State',
+  w.worker_address AS 'Worker Address',
+  w.[state] AS 'Worker State',
+  s.scheduler_address AS 'Scheduler Address',
+  s.[status] AS 'Scheduler State'
+FROM sys.dm_exec_requests r
+CROSS APPLY sys.dm_exec_sql_text(r.sql_handle) qt
+INNER JOIN sys.dm_os_tasks t
+ON r.task_address = t.task_address
+INNER JOIN sys.dm_os_workers w
+ON t.worker_address = w.worker_address
+INNER JOIN sys.dm_os_schedulers s
+ON w.scheduler_address = s.scheduler_address
+WHERE r.session_id = 55
+
+-- Listing 2.1
+-- Query Wait Stats
+SELECT
+  wait_type AS 'Wait Type',
+  waiting_tasks_count AS 'Waiting Tasks Count',
+  (wait_time_ms - signal_wait_time_ms) AS 'Resource Wait Time',
+  signal_wait_time_ms AS 'Signal Wait Time',
+  wait_time_ms AS 'Total Wait Time',
+  COALESCE(wait_time_ms / NULLIF(waiting_tasks_count,0), 0) AS 'Average Wait Time'
+FROM sys.dm_os_wait_stats;
+
+-- Listing 2.2
+-- Query sys.dm_exec_request and include query statement and plan
+SELECT
+  r.session_id AS 'Session ID',
+  r.start_time AS 'Request Start',
+  r.[status] AS 'Current State',
+  r.[command] AS 'Request Command',
+  t.[text] AS 'Query',
+  p.query_plan AS 'Execution Plan'
+FROM sys.dm_exec_requests r
+OUTER APPLY sys.dm_exec_sql_text(r.sql_handle) AS t
+OUTER APPLY sys.dm_exec_query_plan(r.plan_handle) p
+WHERE r.session_id > 50 AND r.session_id <> @@SPID;
+
+-- Listing 2.3
+-- Create wait statistics Extended Event session
+CREATE EVENT SESSION [WaitStats Query] ON SERVER
+ADD EVENT sqlos.wait_info
+  (
+  ACTION(sqlserver.sql_text)
+  WHERE ([sqlserver].[session_id]=(52))
+  )
+ADD TARGET package0.event_file
+  (
+  SET filename = N'E:\Data\WaitStats_XE.xel', metadatafile = N'E:\Data\WaitStats_XE.xem'
+  );
+
+-- Listing 2.4
+-- Return Extend Event file as rows
+IF OBJECT_ID('tempdb..#XE_Data') IS NOT NULL
+DROP TABLE #XE_Data
+
+CREATE TABLE #XE_Data
+  (
+  XE_Data XML
+  );
+GO
+
+INSERT INTO #XE_Data
+  (
+  XE_Data
+  )
+SELECT
+  CAST (event_data AS XML)
+FROM sys.fn_xe_file_target_read_file
+(
+'E:\Data\WaitStats_XE_0_130702270937280000.xel',
+'E:\Data\WaitStats_XE_0_130702270940210000.xem',
+null,
+null
+);
+GO
+
+SELECT
+  XE_Data.value ('(/event/@timestamp)[1]', 'DATETIME') AS 'Date/Time',
+  XE_Data.value ('(/event/data[@name=“opcode”]/text)[1]', 'VARCHAR(100)') AS 'Operation',
+  XE_Data.value ('(/event/data[@name=“wait_type”]/text)[1]','VARCHAR(100)') AS 'Wait Type',
+  XE_Data.value ('(/event/data[@name=“duration”]/value)[1]', 'BIGINT') AS 'Wait Time',
+  XE_Data.value ('(/event/data[@name=“signal_duration”]/value)[1]', 'BIGINT') AS 'Signal Wait Time',
+  XE_Data.value ('(/event/action[@name=“sql_text”]/value)[1]', 'VARCHAR(100)') AS 'Query'
+FROM #XE_Data
+ORDER BY 'Date/Time' ASC
+
+-- Listing 3.1
+-- Query wait statistics information from the Query Store DMVs
+SELECT
+  qsws.plan_id,
+  qsq.query_id,
+  qsws.runtime_stats_interval_id,
+  qsqt.query_sql_text,
+  qsws.wait_category_desc,
+  qsws.total_query_wait_time_ms
+FROM sys.query_store_wait_stats qsws
+INNER JOIN sys.query_store_plan qsp
+ON qsws.plan_id = qsp.plan_id
+INNER JOIN sys.query_store_query qsq
+ON qsp.query_id = qsq.query_id
+INNER JOIN sys.query_store_query_text qsqt
+ON qsq.query_text_id = qsqt.query_text_id
+ORDER BY qsws.total_query_wait_time_ms DESC
+
+-- Listing 3.2
+-- Query wait statistics for a specific Query Store query ID
+SELECT
+  qsws.plan_id,
+  qsq.query_id,
+  qsws.runtime_stats_interval_id,
+  qsqt.query_sql_text,
+  qsws.wait_category_desc,
+  qsws.total_query_wait_time_ms,
+  qsws.avg_query_wait_time_ms,
+  qsws.last_query_wait_time_ms
+FROM sys.query_store_wait_stats qsws
+INNER JOIN sys.query_store_plan qsp
+ON qsws.plan_id = qsp.plan_id
+INNER JOIN sys.query_store_query qsq
+ON qsp.query_id = qsq.query_id
+INNER JOIN sys.query_store_query_text qsqt
+ON qsq.query_text_id = qsqt.query_text_id
+WHERE qsq.query_id = 8
+ORDER BY runtime_stats_interval_id ASC
+
+-- Listing 4.1 
+-- Create a wait statistics baseline database
+CREATE DATABASE [Baseline]
+ON PRIMARY
+  (
+  NAME = N'Baseline', FILENAME = N'E:\Data\baseline_data.mdf', SIZE = 1536000KB, FILEGROWTH = 10%
+  )
+LOG ON
+  (
+  NAME = N'Baseline_log', FILENAME = N'E:\Log\baseline_log.ldf', SIZE = 102400KB, FILEGROWTH = 10%
+  )
+GO
+
+ALTER DATABASE [Baseline] SET RECOVERY SIMPLE
+GO
+
+-- Listing 4.2
+-- Create the table that will hold the wait stats inside the baseline database
+USE [BaseLine]
+GO
+
+CREATE TABLE WaitStats
+(
+  ws_ID INT IDENTITY(1,1) PRIMARY KEY,
+  ws_DateTime DATETIME,
+  ws_Day INT,
+  ws_Month INT,
+  ws_Year INT,
+  ws_Hour INT,
+  ws_Minute INT,
+  ws_DayOfWeek VARCHAR(15),
+  ws_WaitType VARCHAR(50),
+  ws_WaitTime INT,
+  ws_WaitingTasks INT,
+  ws_SignalWaitTime INT
+)
+
+-- Listing 4.3
+-- Capture wait stats into the baseline database and reset them on the instance level
+USE [Baseline]
+GO
+
+
+INSERT INTO WaitStats
+  SELECT
+    GETDATE() AS 'DateTime',
+    DATEPART(DAY,GETDATE()) AS 'Day',
+    DATEPART(MONTH,GETDATE()) AS 'Month',
+    DATEPART(YEAR,GETDATE()) AS 'Year',
+    DATEPART(HOUR, GETDATE()) AS 'Hour',
+    DATEPART(MINUTE, GETDATE()) AS 'Minute',
+    DATENAME(DW, GETDATE()) AS 'DayOfWeek',
+    wait_type AS 'WaitType',
+    wait_time_ms AS 'WaitTime',
+    waiting_tasks_count AS 'WaitingTasks',
+    signal_wait_time_ms AS 'SignalWaitTime'
+  FROM sys.dm_os_wait_stats;
+
+DBCC SQLPERF ('sys.dm_os_wait_stats',CLEAR)
+GO
+
+-- Listing 4.4
+-- Capture wait statis into the baseline database using the delta method
+USE [Baseline]
+GO
+
+IF EXISTS
+  (
+  SELECT *
+  FROM tempdb.dbo.sysobjects
+  WHERE ID = OBJECT_ID(N'tempdb..#ws_Capture')
+  )
+DROP TABLE #ws_Capture;
+
+CREATE TABLE #ws_Capture
+  (
+  wst_WaitType VARCHAR(50),
+  wst_WaitTime INT,
+  wst_WaitingTasks INT,
+  wst_SignalWaitTime INT
+  );
+
+INSERT INTO #ws_Capture
+  SELECT
+    wait_type,
+    wait_time_ms,
+    waiting_tasks_count,
+    signal_wait_time_ms
+  FROM sys.dm_os_wait_stats;
+
+WAITFOR DELAY '00:15:00'
+
+INSERT INTO WaitStats
+  SELECT
+    GETDATE() AS 'DateTime',
+    DATEPART(DAY,GETDATE()) AS 'Day',
+    DATEPART(MONTH,GETDATE()) AS 'Month',
+    DATEPART(YEAR,GETDATE()) AS 'Year',
+    DATEPART(HOUR, GETDATE()) AS 'Hour',
+    DATEPART(MINUTE, GETDATE()) AS 'Minute',
+    DATENAME(DW, GETDATE()) AS 'DayOfWeek',
+    dm.wait_type AS 'WaitType',
+    dm.wait_time_ms - ws.wst_WaitTime AS 'WaitTime',
+    dm.waiting_tasks_count - ws.wst_WaitingTasks AS 'WaitingTasks',
+    dm.signal_wait_time_ms - ws.wst_SignalWaitTime AS 'SignalWaitTime'
+  FROM sys.dm_os_wait_stats dm
+  INNER JOIN #ws_Capture ws
+  ON dm.wait_type = ws.wst_WaitType;
+
+DROP TABLE #ws_Capture;
+
+-- Listing 4.5
+-- Example on how to query wait stats from the baseline database
+SELECT
+  CONVERT(VARCHAR(5), ws_DateTime, 108) AS 'Time',ws_WaitTime AS 'Wait Time'
+FROM WaitStats
+WHERE ws_WaitType = 'PAGEIOLATCH_SH'
+AND (ws_Hour >= 8 AND ws_Hour < 9)
+AND CONVERT(VARCHAR(5), ws_DateTime, 105) = CONVERT(VARCHAR(5), GETDATE(), 105)
+
+-- Listing 4.6
+-- Build a specific wait stats baseline using the baseline database
+SELECT
+  CONVERT(VARCHAR(5), ws_DateTime, 108) AS 'Time',
+  AVG(ws_WaitTime) AS 'Baseline'
+FROM WaitStats
+WHERE ws_WaitType = 'PAGEIOLATCH_SH'
+AND ws_DayOfWeek IN ('Monday', 'Tuesday', 'Wednesday', 'Thursday','Friday')
+AND (ws_Hour >= 8 AND ws_Hour < 9)
+AND CONVERT(VARCHAR(5), ws_DateTime, 105) < CONVERT(VARCHAR(5), GETDATE(), 105)
+GROUP BY CONVERT(VARCHAR(5), ws_DateTime, 108);
+
+-- Listing 5.1
+-- Query top 10 expensive queries based on CPU time
+SELECT TOP 10
+  QText.TEXT AS 'Query',
+  QStats.execution_count AS 'Nr of Executions',
+  QStats.total_worker_time/1000 AS 'Total CPU Time (ms)',
+  QStats.last_worker_time/1000 AS 'Last CPU Time (ms)',
+  QStats.last_execution_time AS 'Last Execution',
+  QPlan.query_plan AS 'Query Plan'
+FROM sys.dm_exec_query_stats QStats
+CROSS APPLY sys.dm_exec_sql_text(QStats.sql_handle) QText
+CROSS APPLY sys.dm_exec_query_plan(QStats.plan_handle) QPlan
+ORDER BY QStats.total_worker_time DESC;
+
+-- Listing 6.4
+-- Query the procedure plan cache
+SELECT
+  objtype,
+  COUNT_BIG (*) AS 'Total Plans',
+  SUM(CAST(size_in_bytes AS DECIMAL(12,2)))/1024/1024 AS 'Size (MB)'
+FROM sys.dm_exec_cached_plans
+GROUP BY objtype;
+
+-- Listing 9.10
+-- Query IO performance
+SELECT
+  [ReadLatency] =
+    CASE WHEN [num_of_reads] = 0
+    THEN 0 ELSE ([io_stall_read_ms] / [num_of_reads]) END,
+  [WriteLatency] =
+    CASE WHEN [num_of_writes] = 0
+    THEN 0 ELSE ([io_stall_write_ms] / [num_of_writes]) END,
+  [Latency] =
+    CASE WHEN ([num_of_reads] = 0 AND [num_of_writes] = 0)
+    THEN 0 ELSE ([io_stall] / ([num_of_reads] + [num_of_writes])) END,
+  [AvgBPerRead] =
+    CASE WHEN [num_of_reads] = 0
+    THEN 0 ELSE ([num_of_bytes_read] / [num_of_reads]) END,
+  [AvgBPerWrite] =
+    CASE WHEN [num_of_writes] = 0
+    THEN 0 ELSE ([num_of_bytes_written] / [num_of_writes]) END,
+  [AvgBPerTransfer] =
+    CASE WHEN ([num_of_reads] = 0 AND [num_of_writes] = 0)
+    THEN 0 ELSE
+  (([num_of_bytes_read] + [num_of_bytes_written]) /
+  ([num_of_reads] + [num_of_writes])) END,
+  LEFT ([mf].[physical_name], 2) AS [Drive],
+  DB_NAME ([vfs].[database_id]) AS [DB],
+  [mf].[physical_name]
+FROM
+sys.dm_io_virtual_file_stats (NULL,NULL) AS [vfs]
+JOIN sys.master_files AS [mf]
+ON [vfs].[database_id] = [mf].[database_id]
+AND [vfs].[file_id] = [mf].[file_id]
+-- WHERE [vfs].[file_id] = 2 -- log files
+ORDER BY [Latency] DESC
+-- ORDER BY [ReadLatency] DESC
+-- ORDER BY [WriteLatency] DESC;
+GO
